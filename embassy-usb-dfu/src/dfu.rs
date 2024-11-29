@@ -1,6 +1,7 @@
+use core::cmp::min;
 use core::marker::PhantomData;
 
-use embassy_boot::{AlignedBuffer, BlockingFirmwareUpdater};
+use embassy_boot::{AlignedBuffer, BlockingFirmwareUpdater, FirmwareUpdaterError};
 use embassy_usb::control::{InResponse, OutResponse, Recipient, RequestType};
 use embassy_usb::driver::Driver;
 use embassy_usb::{Builder, Handler};
@@ -18,7 +19,9 @@ pub struct Control<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_S
     attrs: DfuAttributes,
     state: State,
     status: Status,
-    offset: usize,
+    updater_offset: usize,
+    buf: AlignedBuffer<BLOCK_SIZE>,
+    buf_offset: usize,
     _rst: PhantomData<RST>,
 }
 
@@ -30,15 +33,31 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Co
             attrs,
             state: State::DfuIdle,
             status: Status::Ok,
-            offset: 0,
+            updater_offset: 0,
+            buf: AlignedBuffer([0; BLOCK_SIZE]),
+            buf_offset: 0,
             _rst: PhantomData,
         }
     }
 
     fn reset_state(&mut self) {
-        self.offset = 0;
+        self.updater_offset = 0;
         self.state = State::DfuIdle;
         self.status = Status::Ok;
+    }
+}
+
+impl From<FirmwareUpdaterError> for Status {
+    fn from(e: FirmwareUpdaterError) -> Self {
+        match e {
+            FirmwareUpdaterError::Flash(e) => match e {
+                NorFlashErrorKind::NotAligned => Status::ErrWrite,
+                NorFlashErrorKind::OutOfBounds => Status::ErrAddress,
+                _ => Status::ErrUnknown,
+            },
+            FirmwareUpdaterError::Signature(_) => Status::ErrVerify,
+            FirmwareUpdaterError::BadState => Status::ErrUnknown,
+        }
     }
 }
 
@@ -61,58 +80,76 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Ha
             Ok(Request::Dnload) if self.attrs.contains(DfuAttributes::CAN_DOWNLOAD) => {
                 if req.value == 0 {
                     self.state = State::Download;
-                    self.offset = 0;
+                    self.updater_offset = 0;
+                    self.buf_offset = 0;
                 }
 
-                let mut buf = AlignedBuffer([0; BLOCK_SIZE]);
-                buf.as_mut()[..data.len()].copy_from_slice(data);
+                if self.state != State::Download {
+                    // Unexpected DNLOAD while chip is waiting for a GETSTATUS
+                    self.status = Status::ErrUnknown;
+                    self.state = State::Error;
+                    return Some(OutResponse::Rejected);
+                }
 
-                if req.length == 0 {
-                    match self.updater.mark_updated() {
+                // It can happen that the USB transfers do not come in chunks equal to our block size.
+                // The updater does not like this, therefore we need to buffer received data locally
+                // until we have a full block to flash.
+                //
+                // The current solution assumes that we will at least not receive more data from USB
+                // than our block size.
+                //
+                if data.len() > BLOCK_SIZE {
+                    self.status = Status::ErrUnknown;
+                    self.state = State::Error;
+                    return Some(OutResponse::Rejected);
+                }
+
+                let available_buf_space = BLOCK_SIZE - self.buf_offset;
+                let n_to_copy = min(available_buf_space, data.len());
+                let (data_to_copy, remaining_data) = data.split_at(n_to_copy);
+
+                let buf_offset_after_copy = self.buf_offset + n_to_copy;
+                self.buf.as_mut()[self.buf_offset..buf_offset_after_copy].copy_from_slice(data_to_copy);
+
+                let final_transfer = req.length == 0;
+                if final_transfer {
+                    // There might still be some bytes left to install from the final transfer
+                    let updated = {
+                        if buf_offset_after_copy != 0 {
+                            let to_write = &self.buf.as_ref()[..buf_offset_after_copy];
+                            self.updater.write_firmware(self.updater_offset, to_write)
+                        } else {
+                            Ok(())
+                        }
+                    };
+
+                    match updated.and_then(|_| self.updater.mark_updated()) {
                         Ok(_) => {
                             self.status = Status::Ok;
                             self.state = State::ManifestSync;
                         }
                         Err(e) => {
                             self.state = State::Error;
-                            match e {
-                                embassy_boot::FirmwareUpdaterError::Flash(e) => match e {
-                                    NorFlashErrorKind::NotAligned => self.status = Status::ErrWrite,
-                                    NorFlashErrorKind::OutOfBounds => self.status = Status::ErrAddress,
-                                    _ => self.status = Status::ErrUnknown,
-                                },
-                                embassy_boot::FirmwareUpdaterError::Signature(_) => self.status = Status::ErrVerify,
-                                embassy_boot::FirmwareUpdaterError::BadState => self.status = Status::ErrUnknown,
-                            }
+                            self.status = e.into();
                         }
                     }
-                } else {
-                    if self.state != State::Download {
-                        // Unexpected DNLOAD while chip is waiting for a GETSTATUS
-                        self.status = Status::ErrUnknown;
-                        self.state = State::Error;
-                        return Some(OutResponse::Rejected);
-                    }
-                    match self.updater.write_firmware(self.offset, buf.as_ref()) {
+                } else if buf_offset_after_copy == BLOCK_SIZE {
+                    match self.updater.write_firmware(self.updater_offset, self.buf.as_ref()) {
                         Ok(_) => {
                             self.status = Status::Ok;
                             self.state = State::DlSync;
-                            self.offset += data.len();
+                            self.updater_offset += data.len();
                         }
                         Err(e) => {
                             self.state = State::Error;
-                            match e {
-                                embassy_boot::FirmwareUpdaterError::Flash(e) => match e {
-                                    NorFlashErrorKind::NotAligned => self.status = Status::ErrWrite,
-                                    NorFlashErrorKind::OutOfBounds => self.status = Status::ErrAddress,
-                                    _ => self.status = Status::ErrUnknown,
-                                },
-                                embassy_boot::FirmwareUpdaterError::Signature(_) => self.status = Status::ErrVerify,
-                                embassy_boot::FirmwareUpdaterError::BadState => self.status = Status::ErrUnknown,
-                            }
+                            self.status = e.into();
                         }
                     }
                 }
+
+                let rem_len = remaining_data.len();
+                self.buf.as_mut()[..rem_len].copy_from_slice(remaining_data);
+                self.buf_offset = rem_len;
 
                 Some(OutResponse::Accepted)
             }
