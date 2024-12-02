@@ -98,7 +98,7 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Ha
                 }
 
                 debug!("Copying {} bytes to buffer", data.len());
-                self.buf.as_mut().copy_from_slice(data);
+                self.buf.as_mut()[..data.len()].copy_from_slice(data);
 
                 let final_transfer = req.length == 0;
                 if final_transfer {
@@ -125,6 +125,7 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Ha
                             self.offset += data.len();
                         }
                         Err(e) => {
+                            error!("Error writing firmware: {:?}", e);
                             self.state = State::Error;
                             self.status = e.into();
                         }
