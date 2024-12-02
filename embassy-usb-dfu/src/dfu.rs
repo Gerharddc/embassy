@@ -1,4 +1,3 @@
-use core::cmp::min;
 use core::marker::PhantomData;
 
 use embassy_boot::{AlignedBuffer, BlockingFirmwareUpdater, FirmwareUpdaterError};
@@ -19,9 +18,8 @@ pub struct Control<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_S
     attrs: DfuAttributes,
     state: State,
     status: Status,
-    updater_offset: usize,
+    offset: usize,
     buf: AlignedBuffer<BLOCK_SIZE>,
-    buf_offset: usize,
     _rst: PhantomData<RST>,
 }
 
@@ -33,16 +31,14 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Co
             attrs,
             state: State::DfuIdle,
             status: Status::Ok,
-            updater_offset: 0,
+            offset: 0,
             buf: AlignedBuffer([0; BLOCK_SIZE]),
-            buf_offset: 0,
             _rst: PhantomData,
         }
     }
 
     fn reset_state(&mut self) {
-        self.updater_offset = 0;
-        self.buf_offset = 0;
+        self.offset = 0;
         self.state = State::DfuIdle;
         self.status = Status::Ok;
     }
@@ -84,8 +80,7 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Ha
                 if req.value == 0 {
                     info!("Download starting");
                     self.state = State::Download;
-                    self.updater_offset = 0;
-                    self.buf_offset = 0;
+                    self.offset = 0;
                 }
 
                 if self.state != State::Download {
@@ -95,13 +90,6 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Ha
                     return Some(OutResponse::Rejected);
                 }
 
-                // It can happen that the USB transfers do not come in chunks equal to our block size.
-                // The updater does not like this, therefore we need to buffer received data locally
-                // until we have a full block to flash.
-                //
-                // The current solution assumes that we will at least never receive more data from USB
-                // than our block size.
-                //
                 if data.len() > BLOCK_SIZE {
                     error!("USB data len exceeded block size");
                     self.status = Status::ErrUnknown;
@@ -109,30 +97,14 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Ha
                     return Some(OutResponse::Rejected);
                 }
 
-                let available_buf_space = BLOCK_SIZE - self.buf_offset;
-                let n_to_copy = min(available_buf_space, data.len());
-                let (data_to_copy, remaining_data) = data.split_at(n_to_copy);
-
-                let buf_offset_after_copy = self.buf_offset + n_to_copy;
-                self.buf.as_mut()[self.buf_offset..buf_offset_after_copy].copy_from_slice(data_to_copy);
-                debug!("Copied {} bytes from host to local buffer", data_to_copy.len());
+                debug!("Copying {} bytes to buffer", data.len());
+                self.buf.as_mut().copy_from_slice(data);
 
                 let final_transfer = req.length == 0;
                 if final_transfer {
                     debug!("Receiving final transfer");
 
-                    // There might still be some bytes left to install from the final transfer
-                    let updated = {
-                        if buf_offset_after_copy != 0 {
-                            let to_write = &self.buf.as_ref()[..buf_offset_after_copy];
-                            debug!("Writing final {} bytes at {}", to_write.len(), self.updater_offset);
-                            self.updater.write_firmware(self.updater_offset, to_write)
-                        } else {
-                            Ok(())
-                        }
-                    };
-
-                    match updated.and_then(|_| self.updater.mark_updated()) {
+                    match self.updater.mark_updated() {
                         Ok(_) => {
                             self.status = Status::Ok;
                             self.state = State::ManifestSync;
@@ -144,13 +116,13 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Ha
                             self.status = e.into();
                         }
                     }
-                } else if buf_offset_after_copy == BLOCK_SIZE {
-                    debug!("Writing {} bytes at {}", BLOCK_SIZE, self.updater_offset);
-                    match self.updater.write_firmware(self.updater_offset, self.buf.as_ref()) {
+                } else {
+                    debug!("Writing {} bytes at {}", data.len(), self.offset);
+                    match self.updater.write_firmware(self.offset, self.buf.as_ref()) {
                         Ok(_) => {
                             self.status = Status::Ok;
                             self.state = State::DlSync;
-                            self.updater_offset += data.len();
+                            self.offset += data.len();
                         }
                         Err(e) => {
                             self.state = State::Error;
@@ -158,11 +130,6 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Ha
                         }
                     }
                 }
-
-                let rem_len = remaining_data.len();
-                self.buf.as_mut()[..rem_len].copy_from_slice(remaining_data);
-                self.buf_offset = rem_len;
-                debug!("Remaining bytes to write later: {}", rem_len);
 
                 Some(OutResponse::Accepted)
             }
