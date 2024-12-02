@@ -139,9 +139,9 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Ha
                             info!("Update complete");
                         }
                         Err(e) => {
+                            error!("Error completing update: {}", e);
                             self.state = State::Error;
                             self.status = e.into();
-                            error!("Error completing update: {e}");
                         }
                     }
                 } else if buf_offset_after_copy == BLOCK_SIZE {
@@ -162,7 +162,7 @@ impl<'d, DFU: NorFlash, STATE: NorFlash, RST: Reset, const BLOCK_SIZE: usize> Ha
                 let rem_len = remaining_data.len();
                 self.buf.as_mut()[..rem_len].copy_from_slice(remaining_data);
                 self.buf_offset = rem_len;
-                debug!("Remaining bytes to write later: {}");
+                debug!("Remaining bytes to write later: {}", rem_len);
 
                 Some(OutResponse::Accepted)
             }
