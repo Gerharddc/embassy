@@ -9,14 +9,14 @@
 //! Please also see [crate::uarte] to understand when [BufferedUarte] should be used.
 
 use core::cmp::min;
-use core::future::poll_fn;
+use core::future::{poll_fn, Future};
 use core::marker::PhantomData;
 use core::slice;
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use embassy_hal_internal::atomic_ring_buffer::RingBuffer;
-use embassy_hal_internal::{into_ref, PeripheralRef};
+use embassy_hal_internal::Peri;
 use pac::uarte::vals;
 // Re-export SVD variants to allow user to directly set values
 pub use pac::uarte::vals::{Baudrate, ConfigParity as Parity};
@@ -28,7 +28,7 @@ use crate::ppi::{
 };
 use crate::timer::{Instance as TimerInstance, Timer};
 use crate::uarte::{configure, configure_rx_pins, configure_tx_pins, drop_tx_rx, Config, Instance as UarteInstance};
-use crate::{interrupt, pac, Peripheral, EASY_DMA_SIZE};
+use crate::{interrupt, pac, EASY_DMA_SIZE};
 
 pub(crate) struct State {
     tx_buf: RingBuffer,
@@ -222,27 +222,26 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarte<'d, U, T> {
     /// Panics if `rx_buffer.len()` is odd.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        uarte: impl Peripheral<P = U> + 'd,
-        timer: impl Peripheral<P = T> + 'd,
-        ppi_ch1: impl Peripheral<P = impl ConfigurableChannel> + 'd,
-        ppi_ch2: impl Peripheral<P = impl ConfigurableChannel> + 'd,
-        ppi_group: impl Peripheral<P = impl Group> + 'd,
+        uarte: Peri<'d, U>,
+        timer: Peri<'d, T>,
+        ppi_ch1: Peri<'d, impl ConfigurableChannel>,
+        ppi_ch2: Peri<'d, impl ConfigurableChannel>,
+        ppi_group: Peri<'d, impl Group>,
+        rxd: Peri<'d, impl GpioPin>,
+        txd: Peri<'d, impl GpioPin>,
         _irq: impl interrupt::typelevel::Binding<U::Interrupt, InterruptHandler<U>> + 'd,
-        rxd: impl Peripheral<P = impl GpioPin> + 'd,
-        txd: impl Peripheral<P = impl GpioPin> + 'd,
         config: Config,
         rx_buffer: &'d mut [u8],
         tx_buffer: &'d mut [u8],
     ) -> Self {
-        into_ref!(uarte, timer, rxd, txd, ppi_ch1, ppi_ch2, ppi_group);
         Self::new_inner(
             uarte,
             timer,
-            ppi_ch1.map_into(),
-            ppi_ch2.map_into(),
-            ppi_group.map_into(),
-            rxd.map_into(),
-            txd.map_into(),
+            ppi_ch1.into(),
+            ppi_ch2.into(),
+            ppi_group.into(),
+            rxd.into(),
+            txd.into(),
             None,
             None,
             config,
@@ -258,31 +257,30 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarte<'d, U, T> {
     /// Panics if `rx_buffer.len()` is odd.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_rtscts(
-        uarte: impl Peripheral<P = U> + 'd,
-        timer: impl Peripheral<P = T> + 'd,
-        ppi_ch1: impl Peripheral<P = impl ConfigurableChannel> + 'd,
-        ppi_ch2: impl Peripheral<P = impl ConfigurableChannel> + 'd,
-        ppi_group: impl Peripheral<P = impl Group> + 'd,
+        uarte: Peri<'d, U>,
+        timer: Peri<'d, T>,
+        ppi_ch1: Peri<'d, impl ConfigurableChannel>,
+        ppi_ch2: Peri<'d, impl ConfigurableChannel>,
+        ppi_group: Peri<'d, impl Group>,
+        rxd: Peri<'d, impl GpioPin>,
+        txd: Peri<'d, impl GpioPin>,
+        cts: Peri<'d, impl GpioPin>,
+        rts: Peri<'d, impl GpioPin>,
         _irq: impl interrupt::typelevel::Binding<U::Interrupt, InterruptHandler<U>> + 'd,
-        rxd: impl Peripheral<P = impl GpioPin> + 'd,
-        txd: impl Peripheral<P = impl GpioPin> + 'd,
-        cts: impl Peripheral<P = impl GpioPin> + 'd,
-        rts: impl Peripheral<P = impl GpioPin> + 'd,
         config: Config,
         rx_buffer: &'d mut [u8],
         tx_buffer: &'d mut [u8],
     ) -> Self {
-        into_ref!(uarte, timer, rxd, txd, cts, rts, ppi_ch1, ppi_ch2, ppi_group);
         Self::new_inner(
             uarte,
             timer,
-            ppi_ch1.map_into(),
-            ppi_ch2.map_into(),
-            ppi_group.map_into(),
-            rxd.map_into(),
-            txd.map_into(),
-            Some(cts.map_into()),
-            Some(rts.map_into()),
+            ppi_ch1.into(),
+            ppi_ch2.into(),
+            ppi_group.into(),
+            rxd.into(),
+            txd.into(),
+            Some(cts.into()),
+            Some(rts.into()),
             config,
             rx_buffer,
             tx_buffer,
@@ -291,15 +289,15 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarte<'d, U, T> {
 
     #[allow(clippy::too_many_arguments)]
     fn new_inner(
-        peri: PeripheralRef<'d, U>,
-        timer: PeripheralRef<'d, T>,
-        ppi_ch1: PeripheralRef<'d, AnyConfigurableChannel>,
-        ppi_ch2: PeripheralRef<'d, AnyConfigurableChannel>,
-        ppi_group: PeripheralRef<'d, AnyGroup>,
-        rxd: PeripheralRef<'d, AnyPin>,
-        txd: PeripheralRef<'d, AnyPin>,
-        cts: Option<PeripheralRef<'d, AnyPin>>,
-        rts: Option<PeripheralRef<'d, AnyPin>>,
+        peri: Peri<'d, U>,
+        timer: Peri<'d, T>,
+        ppi_ch1: Peri<'d, AnyConfigurableChannel>,
+        ppi_ch2: Peri<'d, AnyConfigurableChannel>,
+        ppi_group: Peri<'d, AnyGroup>,
+        rxd: Peri<'d, AnyPin>,
+        txd: Peri<'d, AnyPin>,
+        cts: Option<Peri<'d, AnyPin>>,
+        rts: Option<Peri<'d, AnyPin>>,
         config: Config,
         rx_buffer: &'d mut [u8],
         tx_buffer: &'d mut [u8],
@@ -372,20 +370,19 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarte<'d, U, T> {
 
 /// Reader part of the buffered UARTE driver.
 pub struct BufferedUarteTx<'d, U: UarteInstance> {
-    _peri: PeripheralRef<'d, U>,
+    _peri: Peri<'d, U>,
 }
 
 impl<'d, U: UarteInstance> BufferedUarteTx<'d, U> {
     /// Create a new BufferedUarteTx without hardware flow control.
     pub fn new(
-        uarte: impl Peripheral<P = U> + 'd,
+        uarte: Peri<'d, U>,
+        txd: Peri<'d, impl GpioPin>,
         _irq: impl interrupt::typelevel::Binding<U::Interrupt, InterruptHandler<U>> + 'd,
-        txd: impl Peripheral<P = impl GpioPin> + 'd,
         config: Config,
         tx_buffer: &'d mut [u8],
     ) -> Self {
-        into_ref!(uarte, txd);
-        Self::new_inner(uarte, txd.map_into(), None, config, tx_buffer)
+        Self::new_inner(uarte, txd.into(), None, config, tx_buffer)
     }
 
     /// Create a new BufferedUarte with hardware flow control (RTS/CTS)
@@ -394,21 +391,20 @@ impl<'d, U: UarteInstance> BufferedUarteTx<'d, U> {
     ///
     /// Panics if `rx_buffer.len()` is odd.
     pub fn new_with_cts(
-        uarte: impl Peripheral<P = U> + 'd,
+        uarte: Peri<'d, U>,
+        txd: Peri<'d, impl GpioPin>,
+        cts: Peri<'d, impl GpioPin>,
         _irq: impl interrupt::typelevel::Binding<U::Interrupt, InterruptHandler<U>> + 'd,
-        txd: impl Peripheral<P = impl GpioPin> + 'd,
-        cts: impl Peripheral<P = impl GpioPin> + 'd,
         config: Config,
         tx_buffer: &'d mut [u8],
     ) -> Self {
-        into_ref!(uarte, txd, cts);
-        Self::new_inner(uarte, txd.map_into(), Some(cts.map_into()), config, tx_buffer)
+        Self::new_inner(uarte, txd.into(), Some(cts.into()), config, tx_buffer)
     }
 
     fn new_inner(
-        peri: PeripheralRef<'d, U>,
-        txd: PeripheralRef<'d, AnyPin>,
-        cts: Option<PeripheralRef<'d, AnyPin>>,
+        peri: Peri<'d, U>,
+        txd: Peri<'d, AnyPin>,
+        cts: Option<Peri<'d, AnyPin>>,
         config: Config,
         tx_buffer: &'d mut [u8],
     ) -> Self {
@@ -426,9 +422,9 @@ impl<'d, U: UarteInstance> BufferedUarteTx<'d, U> {
     }
 
     fn new_innerer(
-        peri: PeripheralRef<'d, U>,
-        txd: PeripheralRef<'d, AnyPin>,
-        cts: Option<PeripheralRef<'d, AnyPin>>,
+        peri: Peri<'d, U>,
+        txd: Peri<'d, AnyPin>,
+        cts: Option<Peri<'d, AnyPin>>,
         tx_buffer: &'d mut [u8],
     ) -> Self {
         let r = U::regs();
@@ -452,7 +448,7 @@ impl<'d, U: UarteInstance> BufferedUarteTx<'d, U> {
     }
 
     /// Write a buffer into this writer, returning how many bytes were written.
-    pub async fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+    pub fn write<'a>(&'a mut self, buf: &'a [u8]) -> impl Future<Output = Result<usize, Error>> + 'a {
         poll_fn(move |cx| {
             //trace!("poll_write: {:?}", buf.len());
             let ss = U::state();
@@ -477,7 +473,6 @@ impl<'d, U: UarteInstance> BufferedUarteTx<'d, U> {
 
             Poll::Ready(Ok(n))
         })
-        .await
     }
 
     /// Try writing a buffer without waiting, returning how many bytes were written.
@@ -504,7 +499,7 @@ impl<'d, U: UarteInstance> BufferedUarteTx<'d, U> {
     }
 
     /// Flush this output stream, ensuring that all intermediately buffered contents reach their destination.
-    pub async fn flush(&mut self) -> Result<(), Error> {
+    pub fn flush(&mut self) -> impl Future<Output = Result<(), Error>> + '_ {
         poll_fn(move |cx| {
             //trace!("poll_flush");
             let ss = U::state();
@@ -517,7 +512,6 @@ impl<'d, U: UarteInstance> BufferedUarteTx<'d, U> {
 
             Poll::Ready(Ok(()))
         })
-        .await
     }
 }
 
@@ -544,7 +538,7 @@ impl<'a, U: UarteInstance> Drop for BufferedUarteTx<'a, U> {
 
 /// Reader part of the buffered UARTE driver.
 pub struct BufferedUarteRx<'d, U: UarteInstance, T: TimerInstance> {
-    _peri: PeripheralRef<'d, U>,
+    _peri: Peri<'d, U>,
     timer: Timer<'d, T>,
     _ppi_ch1: Ppi<'d, AnyConfigurableChannel, 1, 1>,
     _ppi_ch2: Ppi<'d, AnyConfigurableChannel, 1, 2>,
@@ -559,24 +553,23 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
     /// Panics if `rx_buffer.len()` is odd.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        uarte: impl Peripheral<P = U> + 'd,
-        timer: impl Peripheral<P = T> + 'd,
-        ppi_ch1: impl Peripheral<P = impl ConfigurableChannel> + 'd,
-        ppi_ch2: impl Peripheral<P = impl ConfigurableChannel> + 'd,
-        ppi_group: impl Peripheral<P = impl Group> + 'd,
+        uarte: Peri<'d, U>,
+        timer: Peri<'d, T>,
+        ppi_ch1: Peri<'d, impl ConfigurableChannel>,
+        ppi_ch2: Peri<'d, impl ConfigurableChannel>,
+        ppi_group: Peri<'d, impl Group>,
         _irq: impl interrupt::typelevel::Binding<U::Interrupt, InterruptHandler<U>> + 'd,
-        rxd: impl Peripheral<P = impl GpioPin> + 'd,
+        rxd: Peri<'d, impl GpioPin>,
         config: Config,
         rx_buffer: &'d mut [u8],
     ) -> Self {
-        into_ref!(uarte, timer, rxd, ppi_ch1, ppi_ch2, ppi_group);
         Self::new_inner(
             uarte,
             timer,
-            ppi_ch1.map_into(),
-            ppi_ch2.map_into(),
-            ppi_group.map_into(),
-            rxd.map_into(),
+            ppi_ch1.into(),
+            ppi_ch2.into(),
+            ppi_group.into(),
+            rxd.into(),
             None,
             config,
             rx_buffer,
@@ -590,26 +583,25 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
     /// Panics if `rx_buffer.len()` is odd.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_rts(
-        uarte: impl Peripheral<P = U> + 'd,
-        timer: impl Peripheral<P = T> + 'd,
-        ppi_ch1: impl Peripheral<P = impl ConfigurableChannel> + 'd,
-        ppi_ch2: impl Peripheral<P = impl ConfigurableChannel> + 'd,
-        ppi_group: impl Peripheral<P = impl Group> + 'd,
+        uarte: Peri<'d, U>,
+        timer: Peri<'d, T>,
+        ppi_ch1: Peri<'d, impl ConfigurableChannel>,
+        ppi_ch2: Peri<'d, impl ConfigurableChannel>,
+        ppi_group: Peri<'d, impl Group>,
+        rxd: Peri<'d, impl GpioPin>,
+        rts: Peri<'d, impl GpioPin>,
         _irq: impl interrupt::typelevel::Binding<U::Interrupt, InterruptHandler<U>> + 'd,
-        rxd: impl Peripheral<P = impl GpioPin> + 'd,
-        rts: impl Peripheral<P = impl GpioPin> + 'd,
         config: Config,
         rx_buffer: &'d mut [u8],
     ) -> Self {
-        into_ref!(uarte, timer, rxd, rts, ppi_ch1, ppi_ch2, ppi_group);
         Self::new_inner(
             uarte,
             timer,
-            ppi_ch1.map_into(),
-            ppi_ch2.map_into(),
-            ppi_group.map_into(),
-            rxd.map_into(),
-            Some(rts.map_into()),
+            ppi_ch1.into(),
+            ppi_ch2.into(),
+            ppi_group.into(),
+            rxd.into(),
+            Some(rts.into()),
             config,
             rx_buffer,
         )
@@ -617,13 +609,13 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
 
     #[allow(clippy::too_many_arguments)]
     fn new_inner(
-        peri: PeripheralRef<'d, U>,
-        timer: PeripheralRef<'d, T>,
-        ppi_ch1: PeripheralRef<'d, AnyConfigurableChannel>,
-        ppi_ch2: PeripheralRef<'d, AnyConfigurableChannel>,
-        ppi_group: PeripheralRef<'d, AnyGroup>,
-        rxd: PeripheralRef<'d, AnyPin>,
-        rts: Option<PeripheralRef<'d, AnyPin>>,
+        peri: Peri<'d, U>,
+        timer: Peri<'d, T>,
+        ppi_ch1: Peri<'d, AnyConfigurableChannel>,
+        ppi_ch2: Peri<'d, AnyConfigurableChannel>,
+        ppi_group: Peri<'d, AnyGroup>,
+        rxd: Peri<'d, AnyPin>,
+        rts: Option<Peri<'d, AnyPin>>,
         config: Config,
         rx_buffer: &'d mut [u8],
     ) -> Self {
@@ -642,13 +634,13 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
 
     #[allow(clippy::too_many_arguments)]
     fn new_innerer(
-        peri: PeripheralRef<'d, U>,
-        timer: PeripheralRef<'d, T>,
-        ppi_ch1: PeripheralRef<'d, AnyConfigurableChannel>,
-        ppi_ch2: PeripheralRef<'d, AnyConfigurableChannel>,
-        ppi_group: PeripheralRef<'d, AnyGroup>,
-        rxd: PeripheralRef<'d, AnyPin>,
-        rts: Option<PeripheralRef<'d, AnyPin>>,
+        peri: Peri<'d, U>,
+        timer: Peri<'d, T>,
+        ppi_ch1: Peri<'d, AnyConfigurableChannel>,
+        ppi_ch2: Peri<'d, AnyConfigurableChannel>,
+        ppi_group: Peri<'d, AnyGroup>,
+        rxd: Peri<'d, AnyPin>,
+        rts: Option<Peri<'d, AnyPin>>,
         rx_buffer: &'d mut [u8],
     ) -> Self {
         assert!(rx_buffer.len() % 2 == 0);
@@ -721,7 +713,7 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
     }
 
     /// Return the contents of the internal buffer, filling it with more data from the inner reader if it is empty.
-    pub async fn fill_buf(&mut self) -> Result<&[u8], Error> {
+    pub fn fill_buf(&mut self) -> impl Future<Output = Result<&'_ [u8], Error>> {
         poll_fn(move |cx| {
             compiler_fence(Ordering::SeqCst);
             //trace!("poll_read");
@@ -771,7 +763,6 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
             let buf = s.rx_buf.buf.load(Ordering::Relaxed);
             Poll::Ready(Ok(unsafe { slice::from_raw_parts(buf.add(start), n) }))
         })
-        .await
     }
 
     /// Tell this buffer that `amt` bytes have been consumed from the buffer, so they should no longer be returned in calls to `fill_buf`.

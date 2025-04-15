@@ -4,14 +4,14 @@
 
 pub mod vbus_detect;
 
-use core::future::poll_fn;
+use core::future::{poll_fn, Future};
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{compiler_fence, AtomicU32, Ordering};
 use core::task::Poll;
 
 use cortex_m::peripheral::NVIC;
-use embassy_hal_internal::{into_ref, PeripheralRef};
+use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver as driver;
 use embassy_usb_driver::{Direction, EndpointAddress, EndpointError, EndpointInfo, EndpointType, Event, Unsupported};
@@ -20,7 +20,7 @@ use self::vbus_detect::VbusDetect;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::usbd::vals;
 use crate::util::slice_in_ram;
-use crate::{interrupt, pac, Peripheral};
+use crate::{interrupt, pac};
 
 static BUS_WAKER: AtomicWaker = AtomicWaker::new();
 static EP0_WAKER: AtomicWaker = AtomicWaker::new();
@@ -87,7 +87,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 
 /// USB driver.
 pub struct Driver<'d, T: Instance, V: VbusDetect> {
-    _p: PeripheralRef<'d, T>,
+    _p: Peri<'d, T>,
     alloc_in: Allocator,
     alloc_out: Allocator,
     vbus_detect: V,
@@ -96,12 +96,10 @@ pub struct Driver<'d, T: Instance, V: VbusDetect> {
 impl<'d, T: Instance, V: VbusDetect> Driver<'d, T, V> {
     /// Create a new USB driver.
     pub fn new(
-        usb: impl Peripheral<P = T> + 'd,
+        usb: Peri<'d, T>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         vbus_detect: V,
     ) -> Self {
-        into_ref!(usb);
-
         T::Interrupt::unpend();
         unsafe { T::Interrupt::enable() };
 
@@ -169,7 +167,7 @@ impl<'d, T: Instance, V: VbusDetect + 'd> driver::Driver<'d> for Driver<'d, T, V
 
 /// USB bus.
 pub struct Bus<'d, T: Instance, V: VbusDetect> {
-    _p: PeripheralRef<'d, T>,
+    _p: Peri<'d, T>,
     power_available: bool,
     vbus_detect: V,
 }
@@ -219,8 +217,8 @@ impl<'d, T: Instance, V: VbusDetect> driver::Bus for Bus<'d, T, V> {
         regs.enable().write(|x| x.set_enable(false));
     }
 
-    async fn poll(&mut self) -> Event {
-        poll_fn(move |cx| {
+    fn poll(&mut self) -> impl Future<Output = Event> {
+        poll_fn(|cx| {
             BUS_WAKER.register(cx.waker());
             let regs = T::regs();
 
@@ -277,7 +275,6 @@ impl<'d, T: Instance, V: VbusDetect> driver::Bus for Bus<'d, T, V> {
 
             Poll::Pending
         })
-        .await
     }
 
     fn endpoint_set_stalled(&mut self, ep_addr: EndpointAddress, stalled: bool) {
@@ -468,7 +465,7 @@ impl<'d, T: Instance, Dir: EndpointDir> driver::Endpoint for Endpoint<'d, T, Dir
 
 #[allow(private_bounds)]
 impl<'d, T: Instance, Dir: EndpointDir> Endpoint<'d, T, Dir> {
-    async fn wait_enabled_state(&mut self, state: bool) {
+    fn wait_enabled_state(&mut self, state: bool) -> impl Future<Output = ()> {
         let i = self.info.addr.index();
         assert!(i != 0);
 
@@ -480,12 +477,11 @@ impl<'d, T: Instance, Dir: EndpointDir> Endpoint<'d, T, Dir> {
                 Poll::Pending
             }
         })
-        .await
     }
 
     /// Wait for the endpoint to be disabled
-    pub async fn wait_disabled(&mut self) {
-        self.wait_enabled_state(false).await
+    pub fn wait_disabled(&mut self) -> impl Future<Output = ()> {
+        self.wait_enabled_state(false)
     }
 }
 
@@ -594,7 +590,7 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
 
 /// USB control pipe.
 pub struct ControlPipe<'d, T: Instance> {
-    _p: PeripheralRef<'d, T>,
+    _p: Peri<'d, T>,
     max_packet_size: u16,
 }
 
@@ -781,7 +777,7 @@ pub(crate) trait SealedInstance {
 
 /// USB peripheral instance.
 #[allow(private_bounds)]
-pub trait Instance: Peripheral<P = Self> + SealedInstance + 'static + Send {
+pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
     /// Interrupt for this peripheral.
     type Interrupt: interrupt::typelevel::Interrupt;
 }

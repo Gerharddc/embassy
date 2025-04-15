@@ -157,7 +157,7 @@ impl Future for Timer {
         if self.yielded_once && self.expires_at <= Instant::now() {
             Poll::Ready(())
         } else {
-            embassy_time_queue_driver::schedule_wake(self.expires_at.as_ticks(), cx.waker());
+            embassy_time_driver::schedule_wake(self.expires_at.as_ticks(), cx.waker());
             self.yielded_once = true;
             Poll::Pending
         }
@@ -200,6 +200,10 @@ impl Future for Timer {
 ///     }
 /// }
 /// ```
+///
+/// ## Cancel safety
+/// It is safe to cancel waiting for the next tick,
+/// meaning no tick is lost if the Future is dropped.
 pub struct Ticker {
     expires_at: Instant,
     duration: Duration,
@@ -231,6 +235,9 @@ impl Ticker {
     }
 
     /// Waits for the next tick.
+    ///
+    /// ## Cancel safety
+    /// The produced Future is cancel safe, meaning no tick is lost if the Future is dropped.
     pub fn next(&mut self) -> impl Future<Output = ()> + Send + Sync + '_ {
         poll_fn(|cx| {
             if self.expires_at <= Instant::now() {
@@ -238,7 +245,7 @@ impl Ticker {
                 self.expires_at += dur;
                 Poll::Ready(())
             } else {
-                embassy_time_queue_driver::schedule_wake(self.expires_at.as_ticks(), cx.waker());
+                embassy_time_driver::schedule_wake(self.expires_at.as_ticks(), cx.waker());
                 Poll::Pending
             }
         })
@@ -255,7 +262,7 @@ impl Stream for Ticker {
             self.expires_at += dur;
             Poll::Ready(Some(()))
         } else {
-            embassy_time_queue_driver::schedule_wake(self.expires_at.as_ticks(), cx.waker());
+            embassy_time_driver::schedule_wake(self.expires_at.as_ticks(), cx.waker());
             Poll::Pending
         }
     }

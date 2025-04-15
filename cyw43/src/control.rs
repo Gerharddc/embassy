@@ -35,10 +35,15 @@ pub struct Control<'a> {
     ioctl_state: &'a IoctlState,
 }
 
+/// WiFi scan type.
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ScanType {
+    /// Active scan: the station actively transmits probes that make APs respond.
+    /// Faster, but uses more power.
     Active,
+    /// Passive scan: the station doesn't transmit any probes, just listens for beacons.
+    /// Slower, but uses less power.
     Passive,
 }
 
@@ -526,7 +531,7 @@ impl<'a> Control<'a> {
     }
 
     /// Retrieve the list of configured multicast hardware addresses.
-    pub async fn list_mulistcast_addresses(&mut self, result: &mut [[u8; 6]; 10]) -> usize {
+    pub async fn list_multicast_addresses(&mut self, result: &mut [[u8; 6]; 10]) -> usize {
         let mut buf = [0; 64];
         self.get_iovar("mcast_list", &mut buf).await;
 

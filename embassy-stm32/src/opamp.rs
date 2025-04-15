@@ -1,10 +1,10 @@
 //! Operational Amplifier (OPAMP)
 #![macro_use]
 
-use embassy_hal_internal::{into_ref, PeripheralRef};
+use embassy_hal_internal::PeripheralType;
 
 use crate::pac::opamp::vals::*;
-use crate::Peripheral;
+use crate::Peri;
 
 /// Gain
 #[allow(missing_docs)]
@@ -30,7 +30,7 @@ impl From<OpAmpSpeed> for crate::pac::opamp::vals::Opahsm {
     fn from(v: OpAmpSpeed) -> Self {
         match v {
             OpAmpSpeed::Normal => crate::pac::opamp::vals::Opahsm::NORMAL,
-            OpAmpSpeed::HighSpeed => crate::pac::opamp::vals::Opahsm::HIGHSPEED,
+            OpAmpSpeed::HighSpeed => crate::pac::opamp::vals::Opahsm::HIGH_SPEED,
         }
     }
 }
@@ -52,16 +52,14 @@ pub struct OpAmpInternalOutput<'d, T: Instance> {
 
 /// OpAmp driver.
 pub struct OpAmp<'d, T: Instance> {
-    _inner: PeripheralRef<'d, T>,
+    _inner: Peri<'d, T>,
 }
 
 impl<'d, T: Instance> OpAmp<'d, T> {
     /// Create a new driver instance.
     ///
     /// Does not enable the opamp, but does set the speed mode on some families.
-    pub fn new(opamp: impl Peripheral<P = T> + 'd, #[cfg(opamp_g4)] speed: OpAmpSpeed) -> Self {
-        into_ref!(opamp);
-
+    pub fn new(opamp: Peri<'d, T>, #[cfg(opamp_g4)] speed: OpAmpSpeed) -> Self {
         #[cfg(opamp_g4)]
         T::regs().csr().modify(|w| {
             w.set_opahsm(speed.into());
@@ -82,12 +80,10 @@ impl<'d, T: Instance> OpAmp<'d, T> {
     /// [`OpAmpOutput`] is dropped.
     pub fn buffer_ext(
         &mut self,
-        in_pin: impl Peripheral<P = impl NonInvertingPin<T> + crate::gpio::Pin>,
-        out_pin: impl Peripheral<P = impl OutputPin<T> + crate::gpio::Pin>,
+        in_pin: Peri<'_, impl NonInvertingPin<T> + crate::gpio::Pin>,
+        out_pin: Peri<'_, impl OutputPin<T> + crate::gpio::Pin>,
         gain: OpAmpGain,
     ) -> OpAmpOutput<'_, T> {
-        into_ref!(in_pin);
-        into_ref!(out_pin);
         in_pin.set_as_analog();
         out_pin.set_as_analog();
 
@@ -105,7 +101,7 @@ impl<'d, T: Instance> OpAmp<'d, T> {
             w.set_vm_sel(VmSel::from_bits(vm_sel));
             w.set_pga_gain(PgaGain::from_bits(pga_gain));
             #[cfg(opamp_g4)]
-            w.set_opaintoen(Opaintoen::OUTPUTPIN);
+            w.set_opaintoen(Opaintoen::OUTPUT_PIN);
             w.set_opampen(true);
         });
 
@@ -119,11 +115,7 @@ impl<'d, T: Instance> OpAmp<'d, T> {
     /// directly used as an ADC input. The opamp will be disabled when the
     /// [`OpAmpOutput`] is dropped.
     #[cfg(opamp_g4)]
-    pub fn buffer_dac(
-        &mut self,
-        out_pin: impl Peripheral<P = impl OutputPin<T> + crate::gpio::Pin>,
-    ) -> OpAmpOutput<'_, T> {
-        into_ref!(out_pin);
+    pub fn buffer_dac(&mut self, out_pin: Peri<'_, impl OutputPin<T> + crate::gpio::Pin>) -> OpAmpOutput<'_, T> {
         out_pin.set_as_analog();
 
         T::regs().csr().modify(|w| {
@@ -131,7 +123,7 @@ impl<'d, T: Instance> OpAmp<'d, T> {
 
             w.set_vm_sel(VmSel::OUTPUT);
             w.set_vp_sel(VpSel::DAC3_CH1);
-            w.set_opaintoen(Opaintoen::OUTPUTPIN);
+            w.set_opaintoen(Opaintoen::OUTPUT_PIN);
             w.set_opampen(true);
         });
 
@@ -149,10 +141,9 @@ impl<'d, T: Instance> OpAmp<'d, T> {
     #[cfg(opamp_g4)]
     pub fn buffer_int(
         &mut self,
-        pin: impl Peripheral<P = impl NonInvertingPin<T> + crate::gpio::Pin>,
+        pin: Peri<'_, impl NonInvertingPin<T> + crate::gpio::Pin>,
         gain: OpAmpGain,
     ) -> OpAmpInternalOutput<'_, T> {
-        into_ref!(pin);
         pin.set_as_analog();
 
         // PGA_GAIN value may have different meaning in different MCU serials, use with caution.
@@ -211,7 +202,7 @@ pub(crate) trait SealedOutputPin<T: Instance> {}
 
 /// Opamp instance trait.
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + 'static {}
+pub trait Instance: SealedInstance + PeripheralType + 'static {}
 /// Non-inverting pin trait.
 #[allow(private_bounds)]
 pub trait NonInvertingPin<T: Instance>: SealedNonInvertingPin<T> {}
@@ -251,10 +242,12 @@ foreach_peripheral!(
         impl_opamp_external_output!(OPAMP2, ADC2, 3);
     };
     (opamp, OPAMP3) => {
+        impl_opamp_external_output!(OPAMP3, ADC1, 12);
         impl_opamp_external_output!(OPAMP3, ADC3, 1);
     };
     // OPAMP4 only in STM32G4 Cat 3 devices
     (opamp, OPAMP4) => {
+        impl_opamp_external_output!(OPAMP4, ADC1, 11);
         impl_opamp_external_output!(OPAMP4, ADC4, 3);
     };
     // OPAMP5 only in STM32G4 Cat 3 devices
@@ -264,6 +257,7 @@ foreach_peripheral!(
     // OPAMP6 only in STM32G4 Cat 3/4 devices
     (opamp, OPAMP6) => {
         impl_opamp_external_output!(OPAMP6, ADC1, 14);
+        impl_opamp_external_output!(OPAMP6, ADC2, 14);
     };
 );
 

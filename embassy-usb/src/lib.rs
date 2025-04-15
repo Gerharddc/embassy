@@ -23,7 +23,7 @@ mod config {
 use embassy_futures::select::{select, Either};
 use heapless::Vec;
 
-pub use crate::builder::{Builder, Config, FunctionBuilder, InterfaceAltBuilder, InterfaceBuilder};
+pub use crate::builder::{Builder, Config, FunctionBuilder, InterfaceAltBuilder, InterfaceBuilder, UsbVersion};
 use crate::config::{MAX_HANDLER_COUNT, MAX_INTERFACE_COUNT};
 use crate::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use crate::descriptor::{descriptor_type, lang_id};
@@ -120,7 +120,7 @@ pub trait Handler {
     /// # Returns
     ///
     /// If you didn't handle this request (for example if it's for the wrong interface), return
-    /// `None`. In this case, the the USB stack will continue calling the other handlers, to see
+    /// `None`. In this case, the USB stack will continue calling the other handlers, to see
     /// if another handles it.
     ///
     /// If you did, return `Some` with either `Accepted` or `Rejected`. This will make the USB stack
@@ -142,7 +142,7 @@ pub trait Handler {
     /// # Returns
     ///
     /// If you didn't handle this request (for example if it's for the wrong interface), return
-    /// `None`. In this case, the the USB stack will continue calling the other handlers, to see
+    /// `None`. In this case, the USB stack will continue calling the other handlers, to see
     /// if another handles it.
     ///
     /// If you did, return `Some` with either `Accepted` or `Rejected`. This will make the USB stack

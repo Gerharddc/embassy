@@ -1,6 +1,6 @@
 //! UDP sockets.
 
-use core::future::poll_fn;
+use core::future::{poll_fn, Future};
 use core::mem;
 use core::task::{Context, Poll};
 
@@ -21,7 +21,7 @@ pub enum BindError {
     NoRoute,
 }
 
-/// Error returned by [`UdpSocket::recv_from`] and [`UdpSocket::send_to`].
+/// Error returned by [`UdpSocket::send_to`].
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SendError {
@@ -29,9 +29,11 @@ pub enum SendError {
     NoRoute,
     /// Socket not bound to an outgoing port.
     SocketNotBound,
+    /// There is not enough transmit buffer capacity to ever send this packet.
+    PacketTooLarge,
 }
 
-/// Error returned by [`UdpSocket::recv_from`] and [`UdpSocket::send_to`].
+/// Error returned by [`UdpSocket::recv_from`].
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RecvError {
@@ -107,8 +109,8 @@ impl<'a> UdpSocket<'a> {
     ///
     /// A socket is readable when a packet has been received, or when there are queued packets in
     /// the buffer.
-    pub async fn wait_recv_ready(&self) {
-        poll_fn(move |cx| self.poll_recv_ready(cx)).await
+    pub fn wait_recv_ready(&self) -> impl Future<Output = ()> + '_ {
+        poll_fn(move |cx| self.poll_recv_ready(cx))
     }
 
     /// Wait until a datagram can be read.
@@ -134,8 +136,11 @@ impl<'a> UdpSocket<'a> {
     /// This method will wait until a datagram is received.
     ///
     /// Returns the number of bytes received and the remote endpoint.
-    pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, UdpMetadata), RecvError> {
-        poll_fn(move |cx| self.poll_recv_from(buf, cx)).await
+    pub fn recv_from<'s>(
+        &'s self,
+        buf: &'s mut [u8],
+    ) -> impl Future<Output = Result<(usize, UdpMetadata), RecvError>> + 's {
+        poll_fn(|cx| self.poll_recv_from(buf, cx))
     }
 
     /// Receive a datagram.
@@ -194,8 +199,8 @@ impl<'a> UdpSocket<'a> {
     ///
     /// A socket becomes writable when there is space in the buffer, from initial memory or after
     /// dispatching datagrams on a full buffer.
-    pub async fn wait_send_ready(&self) {
-        poll_fn(move |cx| self.poll_send_ready(cx)).await
+    pub fn wait_send_ready(&self) -> impl Future<Output = ()> + '_ {
+        poll_fn(|cx| self.poll_send_ready(cx))
     }
 
     /// Wait until a datagram can be sent.
@@ -221,6 +226,8 @@ impl<'a> UdpSocket<'a> {
     ///
     /// This method will wait until the datagram has been sent.
     ///
+    /// If the socket's send buffer is too small to fit `buf`, this method will return `Err(SendError::PacketTooLarge)`
+    ///
     /// When the remote endpoint is not reachable, this method will return `Err(SendError::NoRoute)`
     pub async fn send_to<T>(&self, buf: &[u8], remote_endpoint: T) -> Result<(), SendError>
     where
@@ -237,11 +244,19 @@ impl<'a> UdpSocket<'a> {
     /// When the socket's send buffer is full, this method will return `Poll::Pending`
     /// and register the current task to be notified when the buffer has space available.
     ///
+    /// If the socket's send buffer is too small to fit `buf`, this method will return `Poll::Ready(Err(SendError::PacketTooLarge))`
+    ///
     /// When the remote endpoint is not reachable, this method will return `Poll::Ready(Err(Error::NoRoute))`.
     pub fn poll_send_to<T>(&self, buf: &[u8], remote_endpoint: T, cx: &mut Context<'_>) -> Poll<Result<(), SendError>>
     where
         T: Into<UdpMetadata>,
     {
+        // Don't need to wake waker in `with_mut` if the buffer will never fit the udp tx_buffer.
+        let send_capacity_too_small = self.with(|s, _| s.payload_send_capacity() < buf.len());
+        if send_capacity_too_small {
+            return Poll::Ready(Err(SendError::PacketTooLarge));
+        }
+
         self.with_mut(|s, _| match s.send_slice(buf, remote_endpoint) {
             // Entire datagram has been sent
             Ok(()) => Poll::Ready(Ok(())),
@@ -265,12 +280,20 @@ impl<'a> UdpSocket<'a> {
     /// This method will wait until the buffer can fit the requested size before
     /// calling the function to fill its contents.
     ///
+    /// If the socket's send buffer is too small to fit `size`, this method will return `Err(SendError::PacketTooLarge)`
+    ///
     /// When the remote endpoint is not reachable, this method will return `Err(SendError::NoRoute)`
     pub async fn send_to_with<T, F, R>(&mut self, size: usize, remote_endpoint: T, f: F) -> Result<R, SendError>
     where
         T: Into<UdpMetadata> + Copy,
         F: FnOnce(&mut [u8]) -> R,
     {
+        // Don't need to wake waker in `with_mut` if the buffer will never fit the udp tx_buffer.
+        let send_capacity_too_small = self.with(|s, _| s.payload_send_capacity() < size);
+        if send_capacity_too_small {
+            return Err(SendError::PacketTooLarge);
+        }
+
         let mut f = Some(f);
         poll_fn(move |cx| {
             self.with_mut(|s, _| {
@@ -297,8 +320,8 @@ impl<'a> UdpSocket<'a> {
     /// Flush the socket.
     ///
     /// This method will wait until the socket is flushed.
-    pub async fn flush(&mut self) {
-        poll_fn(move |cx| {
+    pub fn flush(&mut self) -> impl Future<Output = ()> + '_ {
+        poll_fn(|cx| {
             self.with_mut(|s, _| {
                 if s.send_queue() == 0 {
                     Poll::Ready(())
@@ -308,7 +331,6 @@ impl<'a> UdpSocket<'a> {
                 }
             })
         })
-        .await
     }
 
     /// Returns the local endpoint of the socket.

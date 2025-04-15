@@ -113,8 +113,8 @@ pub enum TimerPrescaler {
 impl From<TimerPrescaler> for Timpre {
     fn from(value: TimerPrescaler) -> Self {
         match value {
-            TimerPrescaler::DefaultX2 => Timpre::DEFAULTX2,
-            TimerPrescaler::DefaultX4 => Timpre::DEFAULTX4,
+            TimerPrescaler::DefaultX2 => Timpre::DEFAULT_X2,
+            TimerPrescaler::DefaultX4 => Timpre::DEFAULT_X4,
         }
     }
 }
@@ -575,7 +575,7 @@ pub(crate) unsafe fn init(config: Config) {
             Hertz(24_000_000) => Usbrefcksel::MHZ24,
             Hertz(26_000_000) => Usbrefcksel::MHZ26,
             Hertz(32_000_000) => Usbrefcksel::MHZ32,
-            _ => panic!("cannot select USBPHYC reference clock with source frequency of {} Hz, must be one of 16, 19.2, 20, 24, 26, 32 MHz", clk_val),
+            _ => panic!("cannot select USBPHYC reference clock with source frequency of {}, must be one of 16, 19.2, 20, 24, 26, 32 MHz", clk_val),
         },
         None => Usbrefcksel::MHZ24,
     };
@@ -788,11 +788,11 @@ fn init_pll(num: usize, config: Option<Pll>, input: &PllInput) -> PllOutput {
 
     let vco_clk = ref_clk * config.mul;
     let vco_range = if VCO_RANGE.contains(&vco_clk) {
-        Pllvcosel::MEDIUMVCO
+        Pllvcosel::MEDIUM_VCO
     } else if wide_allowed && VCO_WIDE_RANGE.contains(&vco_clk) {
-        Pllvcosel::WIDEVCO
+        Pllvcosel::WIDE_VCO
     } else {
-        panic!("pll vco_clk out of range: {} hz", vco_clk.0)
+        panic!("pll vco_clk out of range: {}", vco_clk)
     };
 
     let p = config.divp.map(|div| {

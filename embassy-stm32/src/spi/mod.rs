@@ -6,7 +6,6 @@ use core::ptr;
 
 use embassy_embedded_hal::SetConfig;
 use embassy_futures::join::join;
-use embassy_hal_internal::PeripheralRef;
 pub use embedded_hal_02::spi::{Mode, Phase, Polarity, MODE_0, MODE_1, MODE_2, MODE_3};
 
 use crate::dma::{word, ChannelAndRequest};
@@ -15,7 +14,7 @@ use crate::mode::{Async, Blocking, Mode as PeriMode};
 use crate::pac::spi::{regs, vals, Spi as Regs};
 use crate::rcc::{RccInfo, SealedRccPeripheral};
 use crate::time::Hertz;
-use crate::Peripheral;
+use crate::Peri;
 
 /// SPI error.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -30,6 +29,21 @@ pub enum Error {
     /// Overrun.
     Overrun,
 }
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let message = match self {
+            Self::Framing => "Invalid Framing",
+            Self::Crc => "Hardware CRC Check Failed",
+            Self::ModeFault => "Mode Fault",
+            Self::Overrun => "Buffer Overrun",
+        };
+
+        write!(f, "{}", message)
+    }
+}
+
+impl core::error::Error for Error {}
 
 /// SPI bit order
 #[derive(Copy, Clone)]
@@ -55,6 +69,9 @@ pub struct Config {
     /// There are some ICs that require a pull-up on the MISO pin for some applications.
     /// If you  are unsure, you probably don't need this.
     pub miso_pull: Pull,
+    /// signal rise/fall speed (slew rate) - defaults to `Medium`.
+    /// Increase for high SPI speeds. Change to `Low` to reduce ringing.
+    pub rise_fall_speed: Speed,
 }
 
 impl Default for Config {
@@ -64,6 +81,7 @@ impl Default for Config {
             bit_order: BitOrder::MsbFirst,
             frequency: Hertz(1_000_000),
             miso_pull: Pull::None,
+            rise_fall_speed: Speed::VeryHigh,
         }
     }
 }
@@ -71,15 +89,15 @@ impl Default for Config {
 impl Config {
     fn raw_phase(&self) -> vals::Cpha {
         match self.mode.phase {
-            Phase::CaptureOnSecondTransition => vals::Cpha::SECONDEDGE,
-            Phase::CaptureOnFirstTransition => vals::Cpha::FIRSTEDGE,
+            Phase::CaptureOnSecondTransition => vals::Cpha::SECOND_EDGE,
+            Phase::CaptureOnFirstTransition => vals::Cpha::FIRST_EDGE,
         }
     }
 
     fn raw_polarity(&self) -> vals::Cpol {
         match self.mode.polarity {
-            Polarity::IdleHigh => vals::Cpol::IDLEHIGH,
-            Polarity::IdleLow => vals::Cpol::IDLELOW,
+            Polarity::IdleHigh => vals::Cpol::IDLE_HIGH,
+            Polarity::IdleLow => vals::Cpol::IDLE_LOW,
         }
     }
 
@@ -92,14 +110,14 @@ impl Config {
 
     #[cfg(gpio_v1)]
     fn sck_af(&self) -> AfType {
-        AfType::output(OutputType::PushPull, Speed::VeryHigh)
+        AfType::output(OutputType::PushPull, self.rise_fall_speed)
     }
 
     #[cfg(gpio_v2)]
     fn sck_af(&self) -> AfType {
         AfType::output_pull(
             OutputType::PushPull,
-            Speed::VeryHigh,
+            self.rise_fall_speed,
             match self.mode.polarity {
                 Polarity::IdleLow => Pull::Down,
                 Polarity::IdleHigh => Pull::Up,
@@ -111,21 +129,22 @@ impl Config {
 pub struct Spi<'d, M: PeriMode> {
     pub(crate) info: &'static Info,
     kernel_clock: Hertz,
-    sck: Option<PeripheralRef<'d, AnyPin>>,
-    mosi: Option<PeripheralRef<'d, AnyPin>>,
-    miso: Option<PeripheralRef<'d, AnyPin>>,
+    sck: Option<Peri<'d, AnyPin>>,
+    mosi: Option<Peri<'d, AnyPin>>,
+    miso: Option<Peri<'d, AnyPin>>,
     tx_dma: Option<ChannelAndRequest<'d>>,
     rx_dma: Option<ChannelAndRequest<'d>>,
     _phantom: PhantomData<M>,
     current_word_size: word_impl::Config,
+    rise_fall_speed: Speed,
 }
 
 impl<'d, M: PeriMode> Spi<'d, M> {
     fn new_inner<T: Instance>(
-        _peri: impl Peripheral<P = T> + 'd,
-        sck: Option<PeripheralRef<'d, AnyPin>>,
-        mosi: Option<PeripheralRef<'d, AnyPin>>,
-        miso: Option<PeripheralRef<'d, AnyPin>>,
+        _peri: Peri<'d, T>,
+        sck: Option<Peri<'d, AnyPin>>,
+        mosi: Option<Peri<'d, AnyPin>>,
+        miso: Option<Peri<'d, AnyPin>>,
         tx_dma: Option<ChannelAndRequest<'d>>,
         rx_dma: Option<ChannelAndRequest<'d>>,
         config: Config,
@@ -140,6 +159,7 @@ impl<'d, M: PeriMode> Spi<'d, M> {
             rx_dma,
             current_word_size: <u8 as SealedWord>::CONFIG,
             _phantom: PhantomData,
+            rise_fall_speed: config.rise_fall_speed,
         };
         this.enable_and_init(config);
         this
@@ -174,7 +194,7 @@ impl<'d, M: PeriMode> Spi<'d, M> {
                 // we're doing "fake rxonly", by actually writing one
                 // byte to TXDR for each byte we want to receive. if we
                 // set OUTPUTDISABLED here, this hangs.
-                w.set_rxonly(vals::Rxonly::FULLDUPLEX);
+                w.set_rxonly(vals::Rxonly::FULL_DUPLEX);
                 w.set_dff(<u8 as SealedWord>::CONFIG)
             });
         }
@@ -211,18 +231,18 @@ impl<'d, M: PeriMode> Spi<'d, M> {
                 w.set_lsbfirst(lsbfirst);
                 w.set_ssm(true);
                 w.set_master(vals::Master::MASTER);
-                w.set_comm(vals::Comm::FULLDUPLEX);
+                w.set_comm(vals::Comm::FULL_DUPLEX);
                 w.set_ssom(vals::Ssom::ASSERTED);
                 w.set_midi(0);
                 w.set_mssi(0);
                 w.set_afcntr(true);
-                w.set_ssiop(vals::Ssiop::ACTIVEHIGH);
+                w.set_ssiop(vals::Ssiop::ACTIVE_HIGH);
             });
             regs.cfg1().modify(|w| {
                 w.set_crcen(false);
                 w.set_mbr(br);
                 w.set_dsize(<u8 as SealedWord>::CONFIG);
-                w.set_fthlv(vals::Fthlv::ONEFRAME);
+                w.set_fthlv(vals::Fthlv::ONE_FRAME);
             });
             regs.cr2().modify(|w| {
                 w.set_tsize(0);
@@ -242,6 +262,17 @@ impl<'d, M: PeriMode> Spi<'d, M> {
         let lsbfirst = config.raw_byte_order();
 
         let br = compute_baud_rate(self.kernel_clock, config.frequency);
+
+        #[cfg(gpio_v2)]
+        {
+            self.rise_fall_speed = config.rise_fall_speed;
+            if let Some(sck) = self.sck.as_ref() {
+                sck.set_speed(config.rise_fall_speed);
+            }
+            if let Some(mosi) = self.mosi.as_ref() {
+                mosi.set_speed(config.rise_fall_speed);
+            }
+        }
 
         #[cfg(any(spi_v1, spi_f1, spi_v2))]
         self.info.regs.cr1().modify(|w| {
@@ -274,12 +305,12 @@ impl<'d, M: PeriMode> Spi<'d, M> {
         #[cfg(any(spi_v3, spi_v4, spi_v5))]
         let cfg1 = self.info.regs.cfg1().read();
 
-        let polarity = if cfg.cpol() == vals::Cpol::IDLELOW {
+        let polarity = if cfg.cpol() == vals::Cpol::IDLE_LOW {
             Polarity::IdleLow
         } else {
             Polarity::IdleHigh
         };
-        let phase = if cfg.cpha() == vals::Cpha::FIRSTEDGE {
+        let phase = if cfg.cpha() == vals::Cpha::FIRST_EDGE {
             Phase::CaptureOnFirstTransition
         } else {
             Phase::CaptureOnSecondTransition
@@ -308,6 +339,7 @@ impl<'d, M: PeriMode> Spi<'d, M> {
             bit_order,
             frequency,
             miso_pull,
+            rise_fall_speed: self.rise_fall_speed,
         }
     }
 
@@ -432,16 +464,16 @@ impl<'d, M: PeriMode> Spi<'d, M> {
 impl<'d> Spi<'d, Blocking> {
     /// Create a new blocking SPI driver.
     pub fn new_blocking<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        sck: impl Peripheral<P = impl SckPin<T>> + 'd,
-        mosi: impl Peripheral<P = impl MosiPin<T>> + 'd,
-        miso: impl Peripheral<P = impl MisoPin<T>> + 'd,
+        peri: Peri<'d, T>,
+        sck: Peri<'d, impl SckPin<T>>,
+        mosi: Peri<'d, impl MosiPin<T>>,
+        miso: Peri<'d, impl MisoPin<T>>,
         config: Config,
     ) -> Self {
         Self::new_inner(
             peri,
             new_pin!(sck, config.sck_af()),
-            new_pin!(mosi, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(mosi, AfType::output(OutputType::PushPull, config.rise_fall_speed)),
             new_pin!(miso, AfType::input(config.miso_pull)),
             None,
             None,
@@ -451,9 +483,9 @@ impl<'d> Spi<'d, Blocking> {
 
     /// Create a new blocking SPI driver, in RX-only mode (only MISO pin, no MOSI).
     pub fn new_blocking_rxonly<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        sck: impl Peripheral<P = impl SckPin<T>> + 'd,
-        miso: impl Peripheral<P = impl MisoPin<T>> + 'd,
+        peri: Peri<'d, T>,
+        sck: Peri<'d, impl SckPin<T>>,
+        miso: Peri<'d, impl MisoPin<T>>,
         config: Config,
     ) -> Self {
         Self::new_inner(
@@ -469,15 +501,15 @@ impl<'d> Spi<'d, Blocking> {
 
     /// Create a new blocking SPI driver, in TX-only mode (only MOSI pin, no MISO).
     pub fn new_blocking_txonly<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        sck: impl Peripheral<P = impl SckPin<T>> + 'd,
-        mosi: impl Peripheral<P = impl MosiPin<T>> + 'd,
+        peri: Peri<'d, T>,
+        sck: Peri<'d, impl SckPin<T>>,
+        mosi: Peri<'d, impl MosiPin<T>>,
         config: Config,
     ) -> Self {
         Self::new_inner(
             peri,
             new_pin!(sck, config.sck_af()),
-            new_pin!(mosi, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(mosi, AfType::output(OutputType::PushPull, config.rise_fall_speed)),
             None,
             None,
             None,
@@ -489,14 +521,14 @@ impl<'d> Spi<'d, Blocking> {
     ///
     /// This can be useful for bit-banging non-SPI protocols.
     pub fn new_blocking_txonly_nosck<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        mosi: impl Peripheral<P = impl MosiPin<T>> + 'd,
+        peri: Peri<'d, T>,
+        mosi: Peri<'d, impl MosiPin<T>>,
         config: Config,
     ) -> Self {
         Self::new_inner(
             peri,
             None,
-            new_pin!(mosi, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(mosi, AfType::output(OutputType::PushPull, config.rise_fall_speed)),
             None,
             None,
             None,
@@ -508,18 +540,18 @@ impl<'d> Spi<'d, Blocking> {
 impl<'d> Spi<'d, Async> {
     /// Create a new SPI driver.
     pub fn new<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        sck: impl Peripheral<P = impl SckPin<T>> + 'd,
-        mosi: impl Peripheral<P = impl MosiPin<T>> + 'd,
-        miso: impl Peripheral<P = impl MisoPin<T>> + 'd,
-        tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
-        rx_dma: impl Peripheral<P = impl RxDma<T>> + 'd,
+        peri: Peri<'d, T>,
+        sck: Peri<'d, impl SckPin<T>>,
+        mosi: Peri<'d, impl MosiPin<T>>,
+        miso: Peri<'d, impl MisoPin<T>>,
+        tx_dma: Peri<'d, impl TxDma<T>>,
+        rx_dma: Peri<'d, impl RxDma<T>>,
         config: Config,
     ) -> Self {
         Self::new_inner(
             peri,
             new_pin!(sck, config.sck_af()),
-            new_pin!(mosi, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(mosi, AfType::output(OutputType::PushPull, config.rise_fall_speed)),
             new_pin!(miso, AfType::input(config.miso_pull)),
             new_dma!(tx_dma),
             new_dma!(rx_dma),
@@ -529,11 +561,11 @@ impl<'d> Spi<'d, Async> {
 
     /// Create a new SPI driver, in RX-only mode (only MISO pin, no MOSI).
     pub fn new_rxonly<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        sck: impl Peripheral<P = impl SckPin<T>> + 'd,
-        miso: impl Peripheral<P = impl MisoPin<T>> + 'd,
-        #[cfg(any(spi_v1, spi_f1, spi_v2))] tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
-        rx_dma: impl Peripheral<P = impl RxDma<T>> + 'd,
+        peri: Peri<'d, T>,
+        sck: Peri<'d, impl SckPin<T>>,
+        miso: Peri<'d, impl MisoPin<T>>,
+        #[cfg(any(spi_v1, spi_f1, spi_v2))] tx_dma: Peri<'d, impl TxDma<T>>,
+        rx_dma: Peri<'d, impl RxDma<T>>,
         config: Config,
     ) -> Self {
         Self::new_inner(
@@ -552,16 +584,16 @@ impl<'d> Spi<'d, Async> {
 
     /// Create a new SPI driver, in TX-only mode (only MOSI pin, no MISO).
     pub fn new_txonly<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        sck: impl Peripheral<P = impl SckPin<T>> + 'd,
-        mosi: impl Peripheral<P = impl MosiPin<T>> + 'd,
-        tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
+        peri: Peri<'d, T>,
+        sck: Peri<'d, impl SckPin<T>>,
+        mosi: Peri<'d, impl MosiPin<T>>,
+        tx_dma: Peri<'d, impl TxDma<T>>,
         config: Config,
     ) -> Self {
         Self::new_inner(
             peri,
             new_pin!(sck, config.sck_af()),
-            new_pin!(mosi, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(mosi, AfType::output(OutputType::PushPull, config.rise_fall_speed)),
             None,
             new_dma!(tx_dma),
             None,
@@ -573,15 +605,15 @@ impl<'d> Spi<'d, Async> {
     ///
     /// This can be useful for bit-banging non-SPI protocols.
     pub fn new_txonly_nosck<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        mosi: impl Peripheral<P = impl MosiPin<T>> + 'd,
-        tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
+        peri: Peri<'d, T>,
+        mosi: Peri<'d, impl MosiPin<T>>,
+        tx_dma: Peri<'d, impl TxDma<T>>,
         config: Config,
     ) -> Self {
         Self::new_inner(
             peri,
             None,
-            new_pin!(mosi, AfType::output(OutputType::PushPull, Speed::VeryHigh)),
+            new_pin!(mosi, AfType::output(OutputType::PushPull, config.rise_fall_speed)),
             None,
             new_dma!(tx_dma),
             None,
@@ -592,9 +624,9 @@ impl<'d> Spi<'d, Async> {
     #[cfg(stm32wl)]
     /// Useful for on chip peripherals like SUBGHZ which are hardwired.
     pub fn new_subghz<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
-        tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
-        rx_dma: impl Peripheral<P = impl RxDma<T>> + 'd,
+        peri: Peri<'d, T>,
+        tx_dma: Peri<'d, impl TxDma<T>>,
+        rx_dma: Peri<'d, impl RxDma<T>>,
     ) -> Self {
         // see RM0453 rev 1 section 7.2.13 page 291
         // The SUBGHZSPI_SCK frequency is obtained by PCLK3 divided by two.
@@ -611,7 +643,7 @@ impl<'d> Spi<'d, Async> {
 
     #[allow(dead_code)]
     pub(crate) fn new_internal<T: Instance>(
-        peri: impl Peripheral<P = T> + 'd,
+        peri: Peri<'d, T>,
         tx_dma: Option<ChannelAndRequest<'d>>,
         rx_dma: Option<ChannelAndRequest<'d>>,
         config: Config,
@@ -675,8 +707,8 @@ impl<'d> Spi<'d, Async> {
             w.i2smod().then(|| {
                 let prev = w.i2scfg();
                 w.set_i2scfg(match prev {
-                    vals::I2scfg::SLAVERX | vals::I2scfg::SLAVEFULLDUPLEX => vals::I2scfg::SLAVERX,
-                    vals::I2scfg::MASTERRX | vals::I2scfg::MASTERFULLDUPLEX => vals::I2scfg::MASTERRX,
+                    vals::I2scfg::SLAVE_RX | vals::I2scfg::SLAVE_FULL_DUPLEX => vals::I2scfg::SLAVE_RX,
+                    vals::I2scfg::MASTER_RX | vals::I2scfg::MASTER_FULL_DUPLEX => vals::I2scfg::MASTER_RX,
                     _ => panic!("unsupported configuration"),
                 });
                 prev
@@ -806,7 +838,7 @@ impl<'d> Spi<'d, Async> {
         let rx_src = self.info.regs.rx_ptr();
         let rx_f = unsafe { self.rx_dma.as_mut().unwrap().read_raw(rx_src, read, Default::default()) };
 
-        let tx_dst = self.info.regs.tx_ptr();
+        let tx_dst: *mut W = self.info.regs.tx_ptr();
         let tx_f = unsafe {
             self.tx_dma
                 .as_mut()
